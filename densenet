@@ -1,178 +1,141 @@
-require 'nn'
-require 'cunn'
-require 'cudnn'
-require 'models/DenseConnectLayer'
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
 
-local function createModel(opt)
+# 定义DenseBlock
+class DenseBlock(nn.Module):
+    def __init__(self, num_layers, in_channels, growth_rate):
+        super(DenseBlock, self).__init__()
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            self.layers.append(self._make_layer(in_channels + i * growth_rate, growth_rate))
+    
+    def _make_layer(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        )
+    
+    def forward(self, x):
+        for layer in self.layers:
+            out = layer(x)
+            x = torch.cat([x, out], 1)
+        return x
 
-   --growth rate
-   local growthRate = opt.growthRate
+# 定义TransitionLayer
+class TransitionLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(TransitionLayer, self).__init__()
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+    
+    def forward(self, x):
+        return self.transition(x)
 
-   --dropout rate, set it to 0 to disable dropout, non-zero number to enable dropout and set drop rate
-   local dropRate = opt.dropRate
+# 定义DenseNet
+class DenseNet(nn.Module):
+    def __init__(self, num_init_features, growth_rate, block_config, num_classes=10):
+        super(DenseNet, self).__init__()
+        
+        # 初始卷积层
+        self.features = nn.Sequential(
+            nn.Conv2d(3, num_init_features, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(num_init_features),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+        
+        # 每个DenseBlock之后跟着一个TransitionLayer
+        num_features = num_init_features
+        for i, num_layers in enumerate(block_config):
+            block = DenseBlock(num_layers, num_features, growth_rate)
+            self.features.add_module(f"denseblock{i + 1}", block)
+            num_features = num_features + num_layers * growth_rate
+            if i != len(block_config) - 1:
+                trans = TransitionLayer(num_features, num_features // 2)
+                self.features.add_module(f"transition{i + 1}", trans)
+                num_features = num_features // 2
+        
+        # 最后一个归一化层
+        self.features.add_module("norm5", nn.BatchNorm2d(num_features))
+        
+        # 分类器
+        self.classifier = nn.Linear(num_features, num_classes)
+    
+    def forward(self, x):
+        features = self.features(x)
+        out = F.relu(features, inplace=True)
+        out = F.adaptive_avg_pool2d(out, (1, 1))
+        out = torch.flatten(out, 1)
+        out = self.classifier(out)
+        return out
 
-   --# channels before entering the first Dense-Block
-   local nChannels = 2 * growthRate
+# 创建DenseNet-121模型
+def densenet121(num_classes=10):
+    return DenseNet(num_init_features=64, growth_rate=32, block_config=(6, 12, 24, 16), num_classes=num_classes)
 
-   --compression rate at transition layers
-   local reduction = opt.reduction
+# 数据加载
+transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomCrop(32, padding=4),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
 
-   --whether to use bottleneck structures
-   local bottleneck = opt.bottleneck
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+trainloader = DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
 
-   --N: # dense connected layers in each denseblock
-   local N = (opt.depth - 4)/3
-   if bottleneck then N = N/2 end
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+testloader = DataLoader(testset, batch_size=128, shuffle=False, num_workers=2)
 
+# 模型、损失函数和优化器
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = densenet121(num_classes=10).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
 
-   function addLayer(model, nChannels, opt)
-      if opt.optMemory >= 3 then
-         model:add(nn.DenseConnectLayerCustom(nChannels, opt))
-      else
-         model:add(DenseConnectLayerStandard(nChannels, opt))     
-      end
-   end
+# 训练函数
+def train(epoch):
+    model.train()
+    running_loss = 0.0
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+        if batch_idx % 100 == 99:  # 每100个batch打印一次
+            print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{batch_idx + 1}/{len(trainloader)}], Loss: {running_loss / 100:.3f}')
+            running_loss = 0.0
 
+# 测试函数
+def test():
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, targets in testloader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+    print(f'Accuracy of the network on the 10000 test images: {100 * correct / total:.2f}%')
 
-   function addTransition(model, nChannels, nOutChannels, opt, last, pool_size)
-      if opt.optMemory >= 3 then     
-         model:add(nn.JoinTable(2))
-      end
-
-      model:add(cudnn.SpatialBatchNormalization(nChannels))
-      model:add(cudnn.ReLU(true))      
-      if last then
-         model:add(cudnn.SpatialAveragePooling(pool_size, pool_size))
-         model:add(nn.Reshape(nChannels))      
-      else
-         model:add(cudnn.SpatialConvolution(nChannels, nOutChannels, 1, 1, 1, 1, 0, 0))
-         if opt.dropRate > 0 then model:add(nn.Dropout(opt.dropRate)) end
-         model:add(cudnn.SpatialAveragePooling(2, 2))
-      end      
-   end
-
-
-   local function addDenseBlock(model, nChannels, opt, N)
-      for i = 1, N do 
-         addLayer(model, nChannels, opt)
-         nChannels = nChannels + opt.growthRate
-      end
-      return nChannels
-   end
-
-
-   -- Build DenseNet
-   local model = nn.Sequential()
-
-   if opt.dataset == 'cifar10' or opt.dataset == 'cifar100' then
-
-      --Initial convolution layer
-      model:add(cudnn.SpatialConvolution(3, nChannels, 3,3, 1,1, 1,1))      
-
-      --Dense-Block 1 and transition
-      nChannels = addDenseBlock(model, nChannels, opt, N)
-      addTransition(model, nChannels, math.floor(nChannels*reduction), opt)
-      nChannels = math.floor(nChannels*reduction)
-
-      --Dense-Block 2 and transition
-      nChannels = addDenseBlock(model, nChannels, opt, N)
-      addTransition(model, nChannels, math.floor(nChannels*reduction), opt)
-      nChannels = math.floor(nChannels*reduction)
-
-      --Dense-Block 3 and transition
-      nChannels = addDenseBlock(model, nChannels, opt, N)
-      addTransition(model, nChannels, nChannels, opt, true, 8)
-
-   elseif opt.dataset == 'imagenet' then
-
-      --number of layers in each block
-      if opt.depth == 121 then
-         stages = {6, 12, 24, 16}
-      elseif opt.depth == 169 then
-         stages = {6, 12, 32, 32}
-      elseif opt.depth == 201 then
-         stages = {6, 12, 48, 32}
-      elseif opt.depth == 161 then
-         stages = {6, 12, 36, 24}
-      else
-         stages = {opt.d1, opt.d2, opt.d3, opt.d4}
-      end
-
-      --Initial transforms follow ResNet(224x224)
-      model:add(cudnn.SpatialConvolution(3, nChannels, 7,7, 2,2, 3,3))
-      model:add(cudnn.SpatialBatchNormalization(nChannels))
-      model:add(cudnn.ReLU(true))
-      model:add(nn.SpatialMaxPooling(3, 3, 2, 2, 1, 1))
-
-      --Dense-Block 1 and transition (56x56)
-      nChannels = addDenseBlock(model, nChannels, opt, stages[1])
-      addTransition(model, nChannels, math.floor(nChannels*reduction), opt)
-      nChannels = math.floor(nChannels*reduction)
-
-      --Dense-Block 2 and transition (28x28)
-      nChannels = addDenseBlock(model, nChannels, opt, stages[2])
-      addTransition(model, nChannels, math.floor(nChannels*reduction), opt)
-      nChannels = math.floor(nChannels*reduction)
-
-      --Dense-Block 3 and transition (14x14)
-      nChannels = addDenseBlock(model, nChannels, opt, stages[3])
-      addTransition(model, nChannels, math.floor(nChannels*reduction), opt)
-      nChannels = math.floor(nChannels*reduction)
-
-      --Dense-Block 4 and transition (7x7)
-      nChannels = addDenseBlock(model, nChannels, opt, stages[4])
-      addTransition(model, nChannels, nChannels, opt, true, 7)
-
-   end
-
-
-   if opt.dataset == 'cifar10' then
-      model:add(nn.Linear(nChannels, 10))
-   elseif opt.dataset == 'cifar100' then
-      model:add(nn.Linear(nChannels, 100))
-   elseif opt.dataset == 'imagenet' then
-      model:add(nn.Linear(nChannels, 1000))
-   end
-
-   --Initialization following ResNet
-   local function ConvInit(name)
-      for k,v in pairs(model:findModules(name)) do
-         local n = v.kW*v.kH*v.nOutputPlane
-         v.weight:normal(0,math.sqrt(2/n))
-         if cudnn.version >= 4000 then
-            v.bias = nil
-            v.gradBias = nil
-         else
-            v.bias:zero()
-         end
-      end
-   end
-
-   local function BNInit(name)
-      for k,v in pairs(model:findModules(name)) do
-         v.weight:fill(1)
-         v.bias:zero()
-      end
-   end
-
-   ConvInit('cudnn.SpatialConvolution')
-   BNInit('cudnn.SpatialBatchNormalization')
-   for k,v in pairs(model:findModules('nn.Linear')) do
-      v.bias:zero()
-   end
-
-   model:type(opt.tensorType)
-
-   if opt.cudnn == 'deterministic' then
-      model:apply(function(m)
-         if m.setMode then m:setMode(1,1,1) end
-      end)
-   end
-
-   model:get(1).gradInput = nil
-
-   print(model)
-   return model
-end
-
-return createModel
+# 主函数
+if __name__ == "__main__":
+    num_epochs = 3  # 减少训练轮数
+    for epoch in range(num_epochs):
+        train(epoch)
+        test()
